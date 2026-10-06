@@ -33,6 +33,19 @@ cdrun -p $sessionPid -q
 
 啟動時 stdout 只輸出 PID。傳送提示詞成功表示已入列，模型會依序處理；請用 `-s` 查看結果。
 
+### 在 Codex app 裡接手
+
+Codex 的一段對話同一時間只能由一個程式寫入。cdrun 只在有工作時佔用對話，處理完、沒有排隊的提示詞時就放手（`-s` 顯示 `status=released`）。這時可以在 Codex 桌面版，或與它配對的手機上，用 `-r` 的名稱找到這段對話，直接接著對話。
+
+之後再用 `-p PID` 傳送提示詞時：
+
+- 沒有其他程式開著這段對話：cdrun 拿回對話，自己執行。
+- Codex app 正開著這段對話：提示詞排進 Codex 的佇列，由 Codex app 執行，結果顯示在 Codex app 裡；`-s` 中這一輪標示為 `delegated`。
+
+cdrun 正在執行時，Codex app 只能檢視、不能輸入，等它放手即可。
+
+結束 session 時，cdrun 會封存這段對話，跟在 Codex app 裡封存一樣。Codex app 當時正開著這段對話的話，Codex 不允許封存，對話就留在 app 裡。
+
 | 指令 | 功能 |
 |---|---|
 | `-d DIR [-r NAME] [prompt]` | 啟動新 session；目錄不存在時自動建立，`-r` 指定對話名稱 |
@@ -41,8 +54,8 @@ cdrun -p $sessionPid -q
 | `-p PID -s` | 顯示最近的對話與狀態 |
 | `-p PID -s --json` | 以 JSON 輸出回答、逐輪狀態與錯誤 |
 | `-p PID --cancel` | 中斷當前回合；保留 session 與排隊中的提示詞 |
-| `-p PID /exit` | 等排隊工作完成後結束 session |
-| `-p PID -q` | 請求結束，寬限十秒後強制關閉仍在執行的 session |
+| `-p PID /exit` | 等排隊工作完成後結束 session，並封存這段對話 |
+| `-p PID -q` | 請求結束並封存對話，寬限十秒後強制關閉仍在執行的 session |
 | `--version` | 顯示版本 |
 | `--help` | 顯示指令說明 |
 
@@ -54,7 +67,12 @@ cdrun -p $sessionPid -q
 
 `-d DIR --trust=false` 可停用 cdrun 傳入的信任設定，改由 Codex 自行決定；這個選項不會撤銷既有信任，也不保證 Codex 不記錄新目錄。
 
-模型沿用 Codex 設定。工具權限固定為 `workspace-write`，不顯示互動批准視窗；需要額外權限的操作會失敗。
+模型、沙盒與核准都沿用 Codex 設定（`~/.codex/config.toml`），跟 Codex app 一樣。cdrun 沒有核准視窗，Codex 要求核准的操作一律拒絕；要讓它不停下來問，請在 Codex 設定裡設好，例如：
+
+```toml
+approval_policy = "never"
+sandbox_mode = "danger-full-access"
+```
 
 ### 技能
 
@@ -94,7 +112,8 @@ $env:CDRUN_CODEX_EXE = 'C:\path\to\codex.exe'
 
 ## 使用範圍
 
-- cdrun 控制背景對話，沒有互動終端、桌面視窗或手機接管功能；`-r` 只設定對話名稱。
+- cdrun 控制背景對話，本身沒有互動終端或桌面視窗；要接手請用 Codex app（見上）。`-r` 設定對話名稱。
+- 由 Codex app 執行的那幾輪，用的是 Codex app 的環境，不是 cdrun 啟動時的環境變數。
 - PID 屬於 cdrun 代理。關閉 session 會清理它自己的子程序，不會關閉其他 Codex 對話。
 - session 結束後請清除保存的 PID，避免日後 Windows 重用同一個 PID。
 - 對話各自獨立，但同一目錄中的檔案仍共用；並行修改請使用不同工作目錄。
