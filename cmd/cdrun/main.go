@@ -35,6 +35,9 @@ type endpoint struct {
 	URL, Token, Dir, Name string
 	Created               uint64
 	Executable            string
+	FinalPath             string
+	ThreadID              string
+	Native                bool
 }
 type request struct{ Prompt string }
 type turn struct {
@@ -48,6 +51,8 @@ type snapshot struct {
 	Completed, Queued                                 int
 	FirstSequence                                     int
 	Turns                                             []turn
+	Archived                                          bool
+	Native                                            bool
 }
 type wire struct {
 	ID     json.RawMessage `json:"id"`
@@ -388,8 +393,7 @@ func (b *broker) releaseWhenIdle() {
 	b.mu.Unlock()
 }
 
-// archive ends the conversation the way the Codex app does. While the Codex app has it open,
-// Codex refuses, and the conversation simply stays there for the user.
+// archive records success only after Codex confirms that the conversation was archived.
 func (b *broker) archive() {
 	if b.r == nil {
 		if b.connect == nil {
@@ -397,6 +401,9 @@ func (b *broker) archive() {
 		}
 		r, err := b.connect()
 		if err != nil {
+			b.mu.Lock()
+			b.state.Error = "conversation not archived: " + err.Error()
+			b.mu.Unlock()
 			return
 		}
 		b.mu.Lock()
@@ -407,6 +414,27 @@ func (b *broker) archive() {
 		b.mu.Lock()
 		b.state.Error = "conversation not archived: " + err.Error()
 		b.mu.Unlock()
+		return
+	}
+	b.mu.Lock()
+	b.state.Archived = true
+	if strings.HasPrefix(b.state.Error, "conversation not archived:") {
+		b.state.Error = ""
+	}
+	b.mu.Unlock()
+}
+
+func (b *broker) archiveWithRetry() {
+	// Release our writer before each attempt; a new server archives persisted state.
+	for attempt := 0; attempt < 3; attempt++ {
+		b.letGo()
+		b.archive()
+		if b.state.Archived {
+			return
+		}
+		if attempt < 2 {
+			time.Sleep(time.Second)
+		}
 	}
 }
 
@@ -720,7 +748,7 @@ func serve(dir, name, codexExe string, trust bool) error {
 		listener.Close()
 		return err
 	}
-	ep := endpoint{PID: os.Getpid(), URL: "http://" + listener.Addr().String(), Token: hex.EncodeToString(token), Dir: dir, Name: name}
+	ep := endpoint{PID: os.Getpid(), URL: "http://" + listener.Addr().String(), Token: hex.EncodeToString(token), Dir: dir, Name: name, FinalPath: filepath.Join(sessionDir, "final.json")}
 	ep.Created, err = processBirth(windows.CurrentProcess())
 	if err != nil {
 		listener.Close()
@@ -732,7 +760,9 @@ func serve(dir, name, codexExe string, trust bool) error {
 		return err
 	}
 	httpServer := &http.Server{Handler: b.handler(ep), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 10 * time.Second, WriteTimeout: 10 * time.Second}
-	go b.run()
+	b.releaseWhenIdle()
+	runDone := make(chan struct{})
+	go func() { defer close(runDone); b.run() }()
 	go func() {
 		if e := httpServer.Serve(listener); e != nil && e != http.ErrServerClosed {
 			b.shutdown()
@@ -745,13 +775,14 @@ func serve(dir, name, codexExe string, trust bool) error {
 	defer os.Remove(endpointPath(ep.PID))
 	// The app-server comes and goes with the work; only an explicit close ends the session.
 	<-b.stop
+	<-runDone
+	b.archiveWithRetry()
 	httpServer.Close()
-	b.archive()
 	b.mu.Lock()
 	b.state.Status = "closed"
-	_ = writeJSON(filepath.Join(sessionDir, "final.json"), b.state)
+	err = writeJSON(ep.FinalPath, b.state)
 	b.mu.Unlock()
-	return nil
+	return err
 }
 
 func loadEndpoint(pid int) (endpoint, error) {
@@ -780,6 +811,9 @@ func fetch(e endpoint, path string, prompt *string) ([]byte, error) {
 	}
 	req.Header.Set("Authorization", "Bearer "+e.Token)
 	client := &http.Client{Timeout: 15 * time.Second, Transport: &http.Transport{Proxy: nil}, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	if e.Native {
+		client.Timeout = 4 * time.Minute
+	}
 	defer client.CloseIdleConnections()
 	resp, err := client.Do(req)
 	if err != nil {
@@ -814,6 +848,10 @@ func launch(dir, name, prompt string, trust bool) error {
 		return err
 	}
 	cleanStaleEndpoints()
+	return launchProcess([]string{"__serve", abs, name, codexExe, strconv.FormatBool(trust)}, prompt, true)
+}
+
+func launchProcess(args []string, prompt string, printPID bool) error {
 	exe, err := os.Executable()
 	if err != nil {
 		return err
@@ -823,7 +861,7 @@ func launch(dir, name, prompt string, trust bool) error {
 		return err
 	}
 	defer f.Close()
-	cmd := exec.Command(exe, "__serve", abs, name, codexExe, strconv.FormatBool(trust))
+	cmd := exec.Command(exe, args...)
 	cmd.Stdout = f
 	cmd.Stderr = f
 	cmd.Env = cleanEnv()
@@ -849,7 +887,9 @@ func launch(dir, name, prompt string, trust bool) error {
 						return err
 					}
 				}
-				fmt.Println(pid)
+				if printPID {
+					fmt.Println(pid)
+				}
 				return nil
 			}
 		}
@@ -866,17 +906,41 @@ func launch(dir, name, prompt string, trust bool) error {
 	return fmt.Errorf("session startup failed: %s (log: %s)", strings.TrimSpace(string(details)), f.Name())
 }
 
-const version = "0.1.2"
-const usage = `cdrun ` + version + ` - drive a headless Codex session by broker PID
-  cdrun -d <dir> [-r <name>] [--trust] [prompt]
-  cdrun -p <pid> <prompt|->
-  cdrun -p <pid> -s [--json]
-  cdrun -p <pid> -q
-  cdrun -p <pid> --cancel
-Launch prints only the broker PID. /exit is handled by cdrun. Not a desktop UI controller.
-An idle session lets go of its conversation, so it can be continued in the Codex app.`
+const version = "0.2.0"
+const usage = `cdrun - start and drive Codex sessions by PID
+
+usage:
+  cdrun -d <working-dir> [-n <name>] [prompt]          start a session, or prompt the one
+                                                       already running; prints its PID
+  cdrun -n <name> <prompt>                             inject a prompt into that session
+  cdrun -n <name> -                                    inject a prompt read from stdin
+  cdrun -n <name> -s                                   print what that session is showing
+  cdrun -n <name> -q                                   end that session
+  cdrun -p <pid> <prompt> | - | -s | -q                the same, picking the session by PID
+  cdrun -l [keyword ...]                               list running sessions and their PIDs
+
+options:
+  -d <dir>     working directory; created if missing
+  -n <name>    name a session with -d (default: directory name), otherwise pick
+               an exact name, ignoring case. With -d, reuse the same name and
+               directory; refuse duplicate names or a different directory.
+  -p <pid>     act on the running session with this broker PID
+  -s           with -p or -n: print session output
+  -q           with -p or -n: end and archive the session
+  -l           list running sessions matching every keyword in name, directory
+               or thread ID (case-insensitive)
+
+cdrun extensions: -s --json, --cancel, -d --trust=false, --version, /exit,
+and discovered /skill-name commands. An idle session releases its conversation
+for the Codex app. -d prints only the PID. Success exits 0; failure exits 1.`
 
 func run(args []string) error {
+	if len(args) > 0 && args[0] == "__observe" {
+		if len(args) != 3 {
+			return errors.New("invalid observer arguments")
+		}
+		return serveNative(args[1], args[2])
+	}
 	if len(args) > 0 && args[0] == "__serve" {
 		if len(args) != 5 {
 			return errors.New("invalid internal arguments")
@@ -890,7 +954,8 @@ func run(args []string) error {
 	fs := flag.NewFlagSet("cdrun", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	dir := fs.String("d", "", "working directory")
-	name := fs.String("r", "", "session name")
+	name := fs.String("n", "", "session name")
+	list := fs.Bool("l", false, "list running sessions")
 	target := fs.String("p", "", "broker PID")
 	screen := fs.Bool("s", false, "read session output")
 	quit := fs.Bool("q", false, "end session")
@@ -903,7 +968,7 @@ func run(args []string) error {
 			fmt.Println(usage)
 			return nil
 		}
-		return err
+		return fmt.Errorf("%w\n%s", err, usage)
 	}
 	if *showVersion {
 		if len(args) != 1 {
@@ -922,20 +987,37 @@ func run(args []string) error {
 	}
 	pid := &pidValue
 	trustSet := false
+	seen := map[string]bool{}
 	fs.Visit(func(f *flag.Flag) {
+		seen[f.Name] = true
 		if f.Name == "trust" {
 			trustSet = true
 		}
 	})
-	if (trustSet && *dir == "") || (*cancel && (*pid == 0 || *screen || *quit || fs.NArg() > 0)) {
+	if (seen["d"] && *dir == "") || (seen["n"] && strings.TrimSpace(*name) == "") || (seen["p"] && *target == "") {
 		return errors.New(usage)
 	}
-	if (*dir == "") == (*pid == 0) || (*screen && *quit) || (*asJSON && !*screen) || ((*screen || *quit) && (*pid == 0 || fs.NArg() > 0)) || (*pid != 0 && *name != "") {
+	if *list {
+		if len(seen) != 1 {
+			return fmt.Errorf("-l takes only keywords\n%s", usage)
+		}
+		for _, s := range fs.Args() {
+			if strings.HasPrefix(s, "-") {
+				return fmt.Errorf("unexpected argument %q\n%s", s, usage)
+			}
+		}
+		return listSessions(fs.Args())
+	}
+	hasTarget := *pid != 0 || *name != ""
+	if (trustSet && *dir == "") || (*cancel && (!hasTarget || *dir != "" || *screen || *quit || fs.NArg() > 0)) {
+		return errors.New(usage)
+	}
+	if (*dir == "" && !hasTarget) || (*dir != "" && (*pid != 0 || *screen || *quit)) || (*screen && *quit) || (*asJSON && !*screen) || ((*screen || *quit) && (!hasTarget || fs.NArg() > 0)) || (*pid != 0 && *name != "") {
 		return errors.New(usage)
 	}
 	for _, s := range fs.Args() {
 		if strings.HasPrefix(s, "-") && s != "-" {
-			return fmt.Errorf("unexpected argument %q; quote the whole prompt and put options before it", s)
+			return fmt.Errorf("unexpected argument %q; quote the whole prompt and put options before it\n%s", s, usage)
 		}
 	}
 	prompt := strings.Join(fs.Args(), " ")
@@ -954,7 +1036,16 @@ func run(args []string) error {
 		return err
 	}
 	if *dir != "" {
-		return launch(*dir, *name, prompt, *trust)
+		return startOrReuse(*dir, *name, prompt, *trust)
+	}
+	if !*screen && !*quit && !*cancel && prompt == "" {
+		return fmt.Errorf("nothing to inject\n%s", usage)
+	}
+	if *name != "" {
+		*pid, err = pidByName(*name)
+		if err != nil {
+			return err
+		}
 	}
 	ep, err := loadEndpoint(*pid)
 	if err != nil {
@@ -994,34 +1085,7 @@ func run(args []string) error {
 		return nil
 	}
 	if *quit {
-		handle, openErr := openVerified(ep, true)
-		if openErr != nil {
-			return openErr
-		}
-		defer windows.CloseHandle(handle)
-		exit := "/exit"
-		_, err = fetch(ep, "/prompt", &exit)
-		if result, waitErr := windows.WaitForSingleObject(handle, 10000); waitErr != nil {
-			return waitErr
-		} else if result == windows.WAIT_OBJECT_0 {
-			return nil
-		}
-		empty := ""
-		_, err = fetch(ep, "/force-close", &empty)
-		if err != nil {
-			_ = windows.TerminateProcess(handle, 1)
-		}
-		if result, waitErr := windows.WaitForSingleObject(handle, 5000); waitErr != nil {
-			return waitErr
-		} else if result != windows.WAIT_OBJECT_0 {
-			if err = windows.TerminateProcess(handle, 1); err != nil {
-				return err
-			}
-			if result, err = windows.WaitForSingleObject(handle, 5000); err != nil || result != windows.WAIT_OBJECT_0 {
-				return errors.New("session did not close")
-			}
-		}
-		return nil
+		return quitSession(ep)
 	}
 	if prompt == "" {
 		return errors.New("nothing to inject")
