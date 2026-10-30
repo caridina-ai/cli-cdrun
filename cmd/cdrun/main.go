@@ -918,6 +918,8 @@ usage:
   cdrun -n <name> -q                                   end that session
   cdrun -p <pid> <prompt> | - | -s | -q                the same, picking the session by PID
   cdrun -l [keyword ...]                               list running sessions and their PIDs
+  cdrun -m <old-dir> <new-dir>                         after a working directory was renamed or
+                                                       moved, move what Codex keeps for it
 
 options:
   -d <dir>     working directory; created if missing
@@ -929,6 +931,8 @@ options:
   -q           with -p or -n: end and archive the session
   -l           list running sessions matching every keyword in name, directory
                or thread ID (case-insensitive)
+  -m           move <old-dir>'s table in Codex's config.toml (its trust) to
+               <new-dir>. Move the directory first; nothing is overwritten.
 
 cdrun extensions: -s --json, --cancel, -d --trust=false, --version, /exit,
 and discovered /skill-name commands. An idle session releases its conversation
@@ -963,6 +967,7 @@ func run(args []string) error {
 	showVersion := fs.Bool("version", false, "print version")
 	trust := fs.Bool("trust", true, "automatically trust this workspace for this private app-server only")
 	cancel := fs.Bool("cancel", false, "interrupt the active turn; keep queued prompts")
+	move := fs.Bool("m", false, "move what Codex keeps for a working directory that moved")
 	if err := fs.Parse(args); err != nil {
 		if err == flag.ErrHelp {
 			fmt.Println(usage)
@@ -996,6 +1001,12 @@ func run(args []string) error {
 	})
 	if (seen["d"] && *dir == "") || (seen["n"] && strings.TrimSpace(*name) == "") || (seen["p"] && *target == "") {
 		return errors.New(usage)
+	}
+	if *move {
+		if len(seen) != 1 || fs.NArg() != 2 {
+			return fmt.Errorf("-m takes the directory's old path and its new one, nothing else\n%s", usage)
+		}
+		return moveSettings(fs.Arg(0), fs.Arg(1))
 	}
 	if *list {
 		if len(seen) != 1 {

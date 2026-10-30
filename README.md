@@ -13,6 +13,8 @@ cdrun -n <name> -s                                   print what that session is 
 cdrun -n <name> -q                                   end that session
 cdrun -p <pid> <prompt> | - | -s | -q                the same, picking the session by PID
 cdrun -l [keyword ...]                               list running sessions and their PIDs
+cdrun -m <old-dir> <new-dir>                         after a working directory was renamed or
+                                                     moved, move what Codex keeps for it
 ```
 
 ## 安裝
@@ -66,6 +68,7 @@ cdrun 正在執行時，Codex app 只能檢視、不能輸入，等它放手即�
 | `-n NAME -q` | 結束 session 並確認封存 |
 | `-p PID <prompt> \| - \| -s \| -q` | 同上，改用 broker PID 指定 |
 | `-l [keyword ...]` | 列出符合所有關鍵字的執行中 session |
+| `-m OLD NEW` | 目錄改名或搬家之後，把 Codex 為舊路徑記的設定搬到新路徑 |
 
 ### 名稱、重複啟動與查詢
 
@@ -118,6 +121,15 @@ broker 的名稱不隨內部 app-server 重啟或重新接回對話而改變。b
 approval_policy = "never"
 sandbox_mode = "danger-full-access"
 ```
+
+目錄改名或搬家之後，Codex 為它記的設定（`config.toml` 裡的 `[projects.'<目錄>']`，例如信任）還留在舊路徑，Codex app 接手的那幾輪就會把新目錄當成陌生的目錄。先搬目錄，再把設定搬過去：
+
+```powershell
+ren D:\projects\my-project my-app
+cdrun -m D:\projects\my-project D:\projects\my-app
+```
+
+新路徑要已經存在、舊路徑要已經不在。新路徑已經有設定時不覆蓋也不合併，報錯 exit 1；舊路徑沒有設定就說一聲，exit 0。
 
 ### 技能
 
