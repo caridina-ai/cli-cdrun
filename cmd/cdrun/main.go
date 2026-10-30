@@ -906,7 +906,7 @@ func launchProcess(args []string, prompt string, printPID bool) error {
 	return fmt.Errorf("session startup failed: %s (log: %s)", strings.TrimSpace(string(details)), f.Name())
 }
 
-const version = "0.2.0"
+const version = "0.3.0"
 const usage = `cdrun - start and drive Codex sessions by PID
 
 usage:
