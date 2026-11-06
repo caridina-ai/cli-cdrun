@@ -161,7 +161,7 @@ func discoverNativeSessions() error {
 		if err := secureStateRoot(); err != nil {
 			return err
 		}
-		if err := launchProcess([]string{"__observe", id, server.exe}, "", false); err != nil {
+		if err := launchProcess([]string{"__observe", id, server.exe}, "", false, false); err != nil {
 			if active, lockErr := nativeWriterActive(id); lockErr == nil && !active {
 				continue
 			}

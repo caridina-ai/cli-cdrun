@@ -52,6 +52,7 @@ type snapshot struct {
 	FirstSequence                                     int
 	Turns                                             []turn
 	Archived                                          bool
+	LeftOpen                                          bool // another writer, usually the Codex app, still holds the conversation
 	Native                                            bool
 }
 type wire struct {
@@ -150,25 +151,31 @@ func (r *rpc) read(out io.Reader) {
 	}
 }
 
-// A broker owns one Codex conversation, but holds it only while it has work. Codex lets a
-// single app-server write to a conversation at a time, so once the broker is idle it stops
-// its app-server and the conversation is free for the Codex app (and a phone paired with it).
-// A later prompt takes the conversation back, or, when the Codex app has it open, is queued
-// into that app's conversation.
+// A broker owns one Codex conversation. Codex lets a single app-server write to a conversation
+// at a time, and the Codex app's windows and paired phones all talk to the app's own app-server.
+// So the broker hands each prompt to the Codex app (see app.go): the app runs the turn, every
+// client of the app can watch and steer it, and the broker follows it from a private app-server
+// that only reads. Without the app, the broker's private app-server runs the turn itself and is
+// stopped once idle, leaving the conversation free.
 type broker struct {
-	mu       sync.Mutex
-	state    snapshot
-	r        *rpc
-	queue    chan string
-	finished chan turn
-	stop     chan struct{}
-	once     sync.Once
-	events   *os.File
-	closing  bool
-	inputs   func(string) ([]any, error)
-	connect  func() (*rpc, error) // starts a fresh app-server; nil keeps r as it is
-	release  func()               // stops it again, freeing the conversation
-	holding  bool                 // this broker's app-server is the conversation's writer
+	mu           sync.Mutex
+	state        snapshot
+	r            *rpc
+	queue        chan string
+	finished     chan turn
+	stop         chan struct{}
+	once         sync.Once
+	events       *os.File
+	closing      bool
+	inputs       func(string) ([]any, error)
+	connect      func() (*rpc, error) // starts a fresh app-server; nil keeps r as it is
+	release      func()               // stops it again, freeing the conversation
+	holding      bool                 // this broker's app-server is the conversation's writer
+	wake         func() error         // asks the Codex app to run queued prompts; nil runs them here
+	writerActive func() (bool, error) // another app-server is the conversation's writer
+	accepted     int                  // queue entries accepted so far
+	taken        int                  // queue entries the broker has taken up so far
+	finalAt      int                  // position of the prompt sent with -q; 0 when none was
 }
 
 func (b *broker) shutdown() { b.once.Do(func() { close(b.stop) }) }
@@ -241,6 +248,8 @@ func (b *broker) run() {
 		case prompt := <-b.queue:
 			b.mu.Lock()
 			b.state.Queued--
+			b.taken++
+			final := b.finalAt != 0 && b.taken == b.finalAt
 			if prompt == "/exit" {
 				b.state.Status = "closed"
 				b.mu.Unlock()
@@ -254,38 +263,58 @@ func (b *broker) run() {
 			}
 			b.state.FirstSequence = b.state.Turns[0].Sequence
 			b.mu.Unlock()
-			if !b.deliver(prompt) {
+			if !b.deliver(prompt, final) {
 				return
 			}
 			b.releaseWhenIdle()
+			b.mu.Lock()
+			if b.closing && len(b.queue) == 0 {
+				b.state.Status = "closed"
+				b.mu.Unlock()
+				b.shutdown()
+				return
+			}
+			b.mu.Unlock()
 		}
 	}
 }
 
-// deliver runs one prompt: in this broker's app-server when it can hold the conversation,
-// otherwise in the queue of the Codex app that has it open. It returns false after a fatal
-// failure; queued work is then dropped, never replayed.
-func (b *broker) deliver(prompt string) bool {
+// deliver runs one prompt to its end: in the Codex app when it is available (see handOff),
+// otherwise in this broker's app-server, or in the queue of whichever app-server has the
+// conversation open. It returns false after a fatal failure; queued work is then dropped,
+// never replayed.
+//
+// The prompt sent with -q (final) runs in this broker's app-server whenever the conversation
+// is free. The Codex app keeps every conversation it ran open until it quits, and Codex cannot
+// archive a conversation another app-server holds, so only a turn the broker runs itself can
+// be archived as soon as it ends. Such a one-off or last task is meant to finish and close,
+// not to be followed elsewhere; the app's windows and phones see the conversation as in use
+// meanwhile. When the app already holds the conversation, the prompt joins the app's queue.
+func (b *broker) deliver(prompt string, final bool) bool {
 	input, err := b.prepare(prompt)
 	if err != nil {
 		b.finishTurn("failed", err.Error())
 		return true
 	}
-	if !b.holding {
+	if b.holding {
+		return b.startTurn(input, newUUID())
+	}
+	if b.wake == nil || final {
 		held, err := b.resume()
 		if err != nil {
 			return b.fatal(err)
 		}
-		if !held {
-			if _, err = b.r.call("thread/queue/add", object{"threadId": b.state.ThreadID, "clientUserMessageId": newUUID(), "input": input}); err != nil {
-				return b.fatal(err)
-			}
-			b.finishTurn("delegated", "")
-			return true
+		if held {
+			return b.startTurn(input, newUUID())
 		}
 	}
+	return b.handOff(input, final)
+}
+
+// startTurn runs a turn in this broker's app-server, which must hold the conversation.
+func (b *broker) startTurn(input []any, client string) bool {
 	r := b.r
-	if _, err = r.call("turn/start", object{"threadId": b.state.ThreadID, "input": input}); err != nil {
+	if _, err := r.call("turn/start", object{"threadId": b.state.ThreadID, "clientUserMessageId": client, "input": input}); err != nil {
 		return b.fatal(err)
 	}
 	select {
@@ -312,23 +341,9 @@ func (b *broker) deliver(prompt string) bool {
 
 // prepare makes sure an app-server is running and turns the prompt into Codex input.
 func (b *broker) prepare(prompt string) ([]any, error) {
-	if b.r != nil {
-		select {
-		case <-b.r.dead:
-		default:
-			return b.input(prompt)
-		}
-	}
-	if b.connect == nil {
-		return nil, errors.New("Codex app-server disconnected")
-	}
-	r, err := b.connect()
-	if err != nil {
+	if err := b.ensureClient(); err != nil {
 		return nil, err
 	}
-	b.mu.Lock()
-	b.r, b.holding = r, false
-	b.mu.Unlock()
 	return b.input(prompt)
 }
 
@@ -393,28 +408,23 @@ func (b *broker) releaseWhenIdle() {
 	b.mu.Unlock()
 }
 
-// archive records success only after Codex confirms that the conversation was archived.
-func (b *broker) archive() {
-	if b.r == nil {
-		if b.connect == nil {
-			return
-		}
-		r, err := b.connect()
-		if err != nil {
-			b.mu.Lock()
-			b.state.Error = "conversation not archived: " + err.Error()
-			b.mu.Unlock()
-			return
-		}
-		b.mu.Lock()
-		b.r = r
-		b.mu.Unlock()
-	}
-	if _, err := b.r.call("thread/archive", object{"threadId": b.state.ThreadID}); err != nil {
+// archive asks Codex once to archive the conversation. It records success only after Codex
+// confirms it, or shows that the conversation was already archived elsewhere, such as in the
+// Codex app. It reports whether another app-server, as the conversation's writer, refused.
+func (b *broker) archive() (refusedByWriter bool) {
+	if err := b.ensureClient(); err != nil {
 		b.mu.Lock()
 		b.state.Error = "conversation not archived: " + err.Error()
 		b.mu.Unlock()
-		return
+		return false
+	}
+	if _, err := b.r.call("thread/archive", object{"threadId": b.state.ThreadID}); err != nil {
+		if !strings.Contains(err.Error(), "no rollout found") || !b.archivedElsewhere() {
+			b.mu.Lock()
+			b.state.Error = "conversation not archived: " + err.Error()
+			b.mu.Unlock()
+			return strings.Contains(err.Error(), "active writer")
+		}
 	}
 	b.mu.Lock()
 	b.state.Archived = true
@@ -422,20 +432,107 @@ func (b *broker) archive() {
 		b.state.Error = ""
 	}
 	b.mu.Unlock()
+	return false
 }
 
-func (b *broker) archiveWithRetry() {
-	// Release our writer before each attempt; a new server archives persisted state.
-	for attempt := 0; attempt < 3; attempt++ {
-		b.letGo()
-		b.archive()
-		if b.state.Archived {
-			return
-		}
-		if attempt < 2 {
-			time.Sleep(time.Second)
+// archivedElsewhere recognizes a conversation that Codex already moved to archived_sessions.
+func (b *broker) archivedElsewhere() bool {
+	raw, err := b.r.call("thread/read", object{"threadId": b.state.ThreadID})
+	if err != nil {
+		return false
+	}
+	var read struct{ Thread struct{ ID, Path string } }
+	if json.Unmarshal(raw, &read) != nil || read.Thread.ID != b.state.ThreadID {
+		return false
+	}
+	for _, part := range strings.Split(filepath.ToSlash(read.Thread.Path), "/") {
+		if strings.EqualFold(part, "archived_sessions") {
+			return true
 		}
 	}
+	return false
+}
+
+// archivePoll paces the wait for another writer to let go of the conversation; archiveGrace
+// bounds that wait.
+var archivePoll, archiveGrace = 5 * time.Second, 15 * time.Second
+
+// archiveWithRetry archives the conversation once all accepted work has finished. Codex refuses
+// to archive a conversation that another app-server holds, and nothing can ask that writer to
+// let go. Usually it is the Codex app, which keeps a conversation it ran open until it quits.
+// So when a writer still holds the conversation after a short grace, the broker ends anyway and
+// leaves the conversation open there (LeftOpen), to be archived in the app. No work is cut
+// short: the app's own turns go on. Other failures get three attempts.
+func (b *broker) archiveWithRetry() {
+	b.mu.Lock()
+	b.state.Status = "archiving"
+	b.mu.Unlock()
+	deadline := time.Now().Add(archiveGrace)
+	failures := 0
+	for {
+		// Release our writer before each attempt; a new server archives persisted state.
+		b.letGo()
+		held := b.othersWriting()
+		if !held && b.wake != nil && b.ensureClient() == nil {
+			// Prompts still waiting in Codex's queue, from the app or a phone, run in the app.
+			if waiting, err := b.queuedInCodex(); err == nil && waiting > 0 && b.wake() == nil {
+				held = true
+			}
+		}
+		if !held {
+			if held = b.archive(); b.state.Archived {
+				return
+			}
+			if !held {
+				if failures++; failures == 3 {
+					return
+				}
+				time.Sleep(time.Second)
+				continue
+			}
+		}
+		if time.Now().After(deadline) {
+			b.mu.Lock()
+			b.state.LeftOpen = true
+			if strings.HasPrefix(b.state.Error, "conversation not archived:") {
+				b.state.Error = ""
+			}
+			b.mu.Unlock()
+			return
+		}
+		time.Sleep(archivePoll)
+	}
+}
+
+// othersWriting reports whether an app-server other than this broker's holds the conversation.
+func (b *broker) othersWriting() bool {
+	if b.writerActive == nil || b.holding {
+		return false
+	}
+	active, err := b.writerActive()
+	return err == nil && active
+}
+
+// ensureClient starts a private app-server when the broker has none.
+func (b *broker) ensureClient() error {
+	if b.r != nil {
+		select {
+		case <-b.r.dead:
+		default:
+			return nil
+		}
+	}
+	if b.connect == nil {
+		return errors.New("Codex app-server disconnected")
+	}
+	r, err := b.connect()
+	if err != nil {
+		return err
+	}
+	b.mu.Lock()
+	b.r, b.holding = r, false
+	b.mu.Unlock()
+	return nil
 }
 
 func (b *broker) letGo() {
@@ -481,7 +578,7 @@ func (b *broker) handler(ep endpoint) http.HandlerFunc {
 			b.mu.Lock()
 			defer b.mu.Unlock()
 			_ = json.NewEncoder(w).Encode(b.state)
-		case r.Method == "POST" && r.URL.Path == "/prompt":
+		case r.Method == "POST" && (r.URL.Path == "/prompt" || r.URL.Path == "/prompt-and-exit"):
 			var q request
 			decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 65536))
 			decoder.DisallowUnknownFields()
@@ -496,7 +593,11 @@ func (b *broker) handler(ep endpoint) http.HandlerFunc {
 			}
 			b.mu.Lock()
 			defer b.mu.Unlock()
-			if prompt == "/exit" && b.state.Error != "" {
+			if prompt == "/exit" && b.closing {
+				_ = json.NewEncoder(w).Encode(object{"closing": true})
+				return
+			}
+			if prompt == "/exit" && b.state.Status == "failed" {
 				b.shutdown()
 				_ = json.NewEncoder(w).Encode(object{"closing": true})
 				return
@@ -505,10 +606,19 @@ func (b *broker) handler(ep endpoint) http.HandlerFunc {
 				http.Error(w, "session unavailable: "+b.state.Error, 409)
 				return
 			}
+			if prompt == "/exit" && len(b.queue) == cap(b.queue) {
+				b.closing = true
+				_ = json.NewEncoder(w).Encode(object{"closing": true})
+				return
+			}
 			select {
 			case b.queue <- prompt:
 				b.state.Queued++
-				if prompt == "/exit" {
+				b.accepted++
+				if r.URL.Path == "/prompt-and-exit" {
+					b.finalAt = b.accepted
+				}
+				if prompt == "/exit" || r.URL.Path == "/prompt-and-exit" {
 					b.closing = true
 				}
 				_ = json.NewEncoder(w).Encode(object{"accepted": true})
@@ -522,8 +632,12 @@ func (b *broker) handler(ep endpoint) http.HandlerFunc {
 				id = b.state.Turns[n-1].ID
 			}
 			thread := b.state.ThreadID
-			r := b.r
+			r, holding := b.r, b.holding
 			b.mu.Unlock()
+			if id != "" && !holding {
+				http.Error(w, "this turn runs in the Codex app; stop it there", 409)
+				return
+			}
 			if id == "" || r == nil {
 				http.Error(w, "no active turn yet", 409)
 				return
@@ -617,6 +731,13 @@ type appServer struct {
 	in       io.WriteCloser
 }
 
+func initializeRPC(r *rpc) error {
+	if _, err := r.call("initialize", object{"clientInfo": object{"name": "cdrun", "title": "cdrun", "version": version}, "capabilities": object{"experimentalApi": true}}); err != nil {
+		return err
+	}
+	return r.send(object{"method": "initialized", "params": object{}})
+}
+
 func (s *appServer) start(notify func(wire)) (*rpc, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -646,11 +767,7 @@ func (s *appServer) start(notify func(wire)) (*rpc, error) {
 	r := &rpc{in: input, pending: make(map[string]chan wire), dead: make(chan struct{}), notify: notify}
 	go r.read(output)
 	// The queue methods that reach the Codex app's copy of the conversation are experimental.
-	if _, err = r.call("initialize", object{"clientInfo": object{"name": "cdrun", "title": "cdrun", "version": version}, "capabilities": object{"experimentalApi": true}}); err != nil {
-		s.stopLocked()
-		return nil, err
-	}
-	if err = r.send(object{"method": "initialized", "params": object{}}); err != nil {
+	if err = initializeRPC(r); err != nil {
 		s.stopLocked()
 		return nil, err
 	}
@@ -689,7 +806,7 @@ func serve(dir, name, codexExe string, trust bool) error {
 		return fmt.Errorf("create session job: %w", err)
 	}
 	// Keep the handle alive until process exit; closing it also terminates this broker.
-	_ = job
+	brokerJob = job
 	sessionDir := filepath.Join(stateRoot(), fmt.Sprintf("session-%d-%d", os.Getpid(), time.Now().Unix()))
 	if err = os.MkdirAll(sessionDir, 0700); err != nil {
 		return err
@@ -732,6 +849,10 @@ func serve(dir, name, codexExe string, trust bool) error {
 	b.state.Model = started.Model
 	b.holding = true
 	b.mu.Unlock()
+	b.writerActive = func() (bool, error) { return nativeWriterActive(started.Thread.ID) }
+	if os.Getenv("CDRUN_CODEX_APP") != "0" {
+		b.wake = func() error { return wakeCodexApp(started.Thread.ID) }
+	}
 	b.inputs = func(prompt string) ([]any, error) { return skillInput(b.r, dir, prompt) }
 	if _, err = b.r.call("thread/name/set", object{"threadId": started.Thread.ID, "name": name}); err != nil {
 		return err
@@ -829,7 +950,7 @@ func fetch(e endpoint, path string, prompt *string) ([]byte, error) {
 	}
 	return data, nil
 }
-func launch(dir, name, prompt string, trust bool) error {
+func launch(dir, name, prompt string, trust, quit bool) error {
 	abs, err := filepath.Abs(dir)
 	if err != nil {
 		return err
@@ -848,10 +969,10 @@ func launch(dir, name, prompt string, trust bool) error {
 		return err
 	}
 	cleanStaleEndpoints()
-	return launchProcess([]string{"__serve", abs, name, codexExe, strconv.FormatBool(trust)}, prompt, true)
+	return launchProcess([]string{"__serve", abs, name, codexExe, strconv.FormatBool(trust)}, prompt, true, quit)
 }
 
-func launchProcess(args []string, prompt string, printPID bool) error {
+func launchProcess(args []string, prompt string, printPID, quit bool) error {
 	exe, err := os.Executable()
 	if err != nil {
 		return err
@@ -880,8 +1001,8 @@ func launchProcess(args []string, prompt string, printPID bool) error {
 		e, loadErr := loadEndpoint(pid)
 		if loadErr == nil {
 			if _, err = fetch(e, "/status", nil); err == nil {
-				if prompt != "" {
-					if _, err = fetch(e, "/prompt", &prompt); err != nil {
+				if prompt != "" || quit {
+					if err = submitPrompt(e, prompt, quit); err != nil {
 						empty := ""
 						_, _ = fetch(e, "/force-close", &empty)
 						return err
@@ -906,16 +1027,16 @@ func launchProcess(args []string, prompt string, printPID bool) error {
 	return fmt.Errorf("session startup failed: %s (log: %s)", strings.TrimSpace(string(details)), f.Name())
 }
 
-const version = "0.3.0"
+const version = "0.4.0"
 const usage = `cdrun - start and drive Codex sessions by PID
 
 usage:
-  cdrun -d <working-dir> [-n <name>] [prompt]          start a session, or prompt the one
+  cdrun -d <working-dir> [-n <name>] [prompt] [-q]     start a session, or prompt the one
                                                        already running; prints its PID
-  cdrun -n <name> <prompt>                             inject a prompt into that session
-  cdrun -n <name> -                                    inject a prompt read from stdin
+  cdrun -n <name> <prompt> [-q]                        inject a prompt into that session
+  cdrun -n <name> - [-q]                               inject a prompt read from stdin
   cdrun -n <name> -s                                   print what that session is showing
-  cdrun -n <name> -q                                   end that session
+  cdrun -n <name> -q                                   drain, then end and archive the session
   cdrun -p <pid> <prompt> | - | -s | -q                the same, picking the session by PID
   cdrun -l [keyword ...]                               list running sessions and their PIDs
   cdrun -m <old-dir> <new-dir>                         after a working directory was renamed or
@@ -928,7 +1049,9 @@ options:
                directory; refuse duplicate names or a different directory.
   -p <pid>     act on the running session with this broker PID
   -s           with -p or -n: print session output
-  -q           with -p or -n: end and archive the session
+  -q           drain queued work, then end and archive; may follow a prompt.
+               With a prompt or -d, return once accepted; standalone waits
+               for the session to end. Never interrupt work or impose a deadline.
   -l           list running sessions matching every keyword in name, directory
                or thread ID (case-insensitive)
   -m           move <old-dir>'s table in Codex's config.toml (its trust) to
@@ -936,9 +1059,18 @@ options:
 
 cdrun extensions: -s --json, --cancel, -d --trust=false, --version, /exit,
 and discovered /skill-name commands. An idle session releases its conversation
-for the Codex app. -d prints only the PID. Success exits 0; failure exits 1.`
+for the Codex app. Turns run in the Codex app when it is installed, so its
+windows and paired phones can follow them; CDRUN_CODEX_APP=0 keeps them here.
+A prompt sent with -q runs here, so the session archives right after it.
+A conversation the Codex app still holds at the end stays there to archive.
+Native conversations cannot combine a prompt with -q;
+archive them in their Codex app or CLI. -d prints only the PID.
+Success exits 0; failure exits 1.`
 
 func run(args []string) error {
+	if len(args) == 2 && args[0] == "__wake" {
+		return openWakeLink(args[1])
+	}
 	if len(args) > 0 && args[0] == "__observe" {
 		if len(args) != 3 {
 			return errors.New("invalid observer arguments")
@@ -968,7 +1100,7 @@ func run(args []string) error {
 	trust := fs.Bool("trust", true, "automatically trust this workspace for this private app-server only")
 	cancel := fs.Bool("cancel", false, "interrupt the active turn; keep queued prompts")
 	move := fs.Bool("m", false, "move what Codex keeps for a working directory that moved")
-	if err := fs.Parse(args); err != nil {
+	if err := fs.Parse(quitArgs(args)); err != nil {
 		if err == flag.ErrHelp {
 			fmt.Println(usage)
 			return nil
@@ -1023,7 +1155,7 @@ func run(args []string) error {
 	if (trustSet && *dir == "") || (*cancel && (!hasTarget || *dir != "" || *screen || *quit || fs.NArg() > 0)) {
 		return errors.New(usage)
 	}
-	if (*dir == "" && !hasTarget) || (*dir != "" && (*pid != 0 || *screen || *quit)) || (*screen && *quit) || (*asJSON && !*screen) || ((*screen || *quit) && (!hasTarget || fs.NArg() > 0)) || (*pid != 0 && *name != "") {
+	if (*dir == "" && !hasTarget) || (*dir != "" && (*pid != 0 || *screen)) || (*screen && *quit) || (*asJSON && !*screen) || (*screen && (!hasTarget || fs.NArg() > 0)) || (*pid != 0 && *name != "") {
 		return errors.New(usage)
 	}
 	for _, s := range fs.Args() {
@@ -1047,7 +1179,7 @@ func run(args []string) error {
 		return err
 	}
 	if *dir != "" {
-		return startOrReuse(*dir, *name, prompt, *trust)
+		return startOrReuse(*dir, *name, prompt, *trust, *quit)
 	}
 	if !*screen && !*quit && !*cancel && prompt == "" {
 		return fmt.Errorf("nothing to inject\n%s", usage)
@@ -1083,26 +1215,25 @@ func run(args []string) error {
 		fmt.Printf("[cdrun status=%s completed=%d queued=%d]\nthread=%s model=%s\n", s.Status, s.Completed, s.Queued, s.ThreadID, s.Model)
 		for _, t := range s.Turns {
 			fmt.Printf("\n> %s\n%s\n", t.Prompt, t.Answer)
-			if t.Status == "delegated" {
-				fmt.Println("(queued in the Codex app, which has this conversation open)")
-			}
 			if t.Error != "" {
 				fmt.Println("ERROR:", t.Error)
 			}
+		}
+		if s.Status == "archiving" {
+			fmt.Println("(archiving; if the Codex app still has this conversation open, the session ends and leaves it there)")
 		}
 		if s.Error != "" {
 			fmt.Println("ERROR:", s.Error)
 		}
 		return nil
 	}
-	if *quit {
+	if *quit && prompt == "" {
 		return quitSession(ep)
 	}
 	if prompt == "" {
 		return errors.New("nothing to inject")
 	}
-	_, err = fetch(ep, "/prompt", &prompt)
-	return err
+	return submitPrompt(ep, prompt, *quit)
 }
 func main() {
 	if err := run(os.Args[1:]); err != nil {

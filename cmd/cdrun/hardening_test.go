@@ -98,6 +98,7 @@ func TestStrictIPC(t *testing.T) {
 		}
 	}
 	b.state.Error = "server failed"
+	b.state.Status = "failed"
 	r := httptest.NewRequest(http.MethodPost, "/prompt", strings.NewReader(`{"Prompt":"/exit"}`))
 	r.Header.Set("Authorization", "Bearer secret")
 	w := httptest.NewRecorder()
@@ -214,7 +215,7 @@ func TestCancelSendsCurrentTurnIdentity(t *testing.T) {
 	defer reader.Close()
 	defer writer.Close()
 	rpcClient := &rpc{in: writer, pending: make(map[string]chan wire), dead: make(chan struct{})}
-	b := &broker{r: rpcClient, state: snapshot{ThreadID: "thread", Turns: []turn{{ID: "turn", Status: "inProgress"}}}}
+	b := &broker{r: rpcClient, holding: true, state: snapshot{ThreadID: "thread", Turns: []turn{{ID: "turn", Status: "inProgress"}}}}
 	got := make(chan wire, 1)
 	go func() {
 		var w wire

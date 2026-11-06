@@ -58,14 +58,14 @@ func TestNamesAndVerifiedDiscovery(t *testing.T) {
 func TestReuseAndConflictWithoutCreatingDirectory(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "work")
 	e := fixtureSession(t, "name1", dir)
-	if err := startOrReuse(strings.ToUpper(dir)+`\`, "NAME1", "hello", true); err != nil {
+	if err := startOrReuse(strings.ToUpper(dir)+`\`, "NAME1", "hello", true, false); err != nil {
 		t.Fatal(err)
 	}
 	if pid, err := pidByName("NAME1"); err != nil || pid != e.PID {
 		t.Fatal(pid, err)
 	}
 	other := filepath.Join(t.TempDir(), "must-not-exist")
-	if err := startOrReuse(other, "name1", "", true); err == nil || !strings.Contains(err.Error(), strconv.Itoa(e.PID)) {
+	if err := startOrReuse(other, "name1", "", true, false); err == nil || !strings.Contains(err.Error(), strconv.Itoa(e.PID)) {
 		t.Fatal(err)
 	}
 	if _, err := os.Stat(other); !os.IsNotExist(err) {
@@ -83,7 +83,7 @@ func TestReuseWithExistingWindowsMutex(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer windows.CloseHandle(h)
-	if err := startOrReuse(dir, "existing-lock", "", true); err != nil {
+	if err := startOrReuse(dir, "existing-lock", "", true, false); err != nil {
 		t.Fatal("existing named mutex must be opened and waited on", err)
 	}
 }
@@ -109,10 +109,12 @@ func TestKeywordMatchingAndWindowsDirectories(t *testing.T) {
 }
 
 func TestCLIContractRejectsInvalidCombinations(t *testing.T) {
+	t.Setenv("CODEX_HOME", t.TempDir())
+	t.Setenv("LOCALAPPDATA", t.TempDir())
 	for _, args := range [][]string{
-		{"-r", "old"}, {"-d", "x", "-r", "old"}, {"-d", "x", "-s"}, {"-d", "x", "-q"},
+		{"-r", "old"}, {"-d", "x", "-r", "old"}, {"-d", "x", "-s"},
 		{"-p", "1", "-n", "name", "hi"}, {"-n", "name"}, {"-p", "1"}, {"-s"}, {"-q"},
-		{"-n", "name", "-s", "hi"}, {"-n", "name", "-q", "hi"}, {"-n", "name", "-s", "-q"},
+		{"-n", "name", "-s", "hi"}, {"-n", "name", "-s", "-q"},
 		{"-l", "-d", "x"}, {"-l", "-n", "x"}, {"-l", "-p", "1"}, {"-l", "-s"}, {"-l", "-q"},
 		{"-n", "", "hi"}, {"-d", ""}, {"-n", "x", "--trust=false", "hi"},
 	} {

@@ -86,10 +86,25 @@ func ambiguousName(name string, found []runningSession) error {
 	return fmt.Errorf("%d running sessions are named %q (pids %s); pick one with -p", len(found), name, strings.Join(pids, ", "))
 }
 
+// withoutArchiving drops brokers that only wait to archive: their work is done and they accept
+// no more, so they neither claim a name for a new launch nor make a name ambiguous.
+func withoutArchiving(found []runningSession) []runningSession {
+	var open []runningSession
+	for _, s := range found {
+		if s.Status != "archiving" {
+			open = append(open, s)
+		}
+	}
+	return open
+}
+
 func pidByName(name string) (int, error) {
 	found, err := sessionsNamed(name)
 	if err != nil {
 		return 0, err
+	}
+	if open := withoutArchiving(found); len(open) > 0 {
+		found = open
 	}
 	if len(found) == 0 {
 		return 0, fmt.Errorf("no running session is named %q; cdrun -l lists them", name)
@@ -104,7 +119,7 @@ func sameDirectory(a, b string) bool {
 	return strings.EqualFold(filepath.Clean(strings.ReplaceAll(a, "/", `\`)), filepath.Clean(strings.ReplaceAll(b, "/", `\`)))
 }
 
-func startOrReuse(dir, name, prompt string, trust bool) error {
+func startOrReuse(dir, name, prompt string, trust, quit bool) error {
 	// Windows mutex ownership belongs to an OS thread, not a Go goroutine.
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
@@ -143,6 +158,7 @@ func startOrReuse(dir, name, prompt string, trust bool) error {
 	if err != nil {
 		return err
 	}
+	found = withoutArchiving(found)
 	if len(found) > 1 {
 		return ambiguousName(name, found)
 	}
@@ -151,8 +167,8 @@ func startOrReuse(dir, name, prompt string, trust bool) error {
 		if !sameDirectory(abs, s.Dir) {
 			return fmt.Errorf("session %q is already running in %s (pid %d); no new session started", name, s.Dir, s.PID)
 		}
-		if prompt != "" {
-			if _, err := fetch(s.endpoint, "/prompt", &prompt); err != nil {
+		if prompt != "" || quit {
+			if err := submitPrompt(s.endpoint, prompt, quit); err != nil {
 				return err
 			}
 		}
@@ -160,7 +176,7 @@ func startOrReuse(dir, name, prompt string, trust bool) error {
 		fmt.Println(s.PID)
 		return nil
 	}
-	return launch(abs, name, prompt, trust)
+	return launch(abs, name, prompt, trust, quit)
 }
 
 func (s runningSession) matches(keywords []string) bool {

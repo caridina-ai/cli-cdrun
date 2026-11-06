@@ -5,12 +5,12 @@
 啟動時指定名稱，之後用名稱或傳回的 PID 傳送提示詞、讀取回答或結束對話。各個 session 獨立執行，可同時操作多個專案。
 
 ```text
-cdrun -d <working-dir> [-n <name>] [prompt]          start a session, or prompt the one
+cdrun -d <working-dir> [-n <name>] [prompt] [-q]     start a session, or prompt the one
                                                      already running; prints its PID
-cdrun -n <name> <prompt>                             inject a prompt into that session
-cdrun -n <name> -                                    inject a prompt read from stdin
+cdrun -n <name> <prompt> [-q]                        inject a prompt into that session
+cdrun -n <name> - [-q]                               inject a prompt read from stdin
 cdrun -n <name> -s                                   print what that session is showing
-cdrun -n <name> -q                                   end that session
+cdrun -n <name> -q                                   drain, then end and archive the session
 cdrun -p <pid> <prompt> | - | -s | -q                the same, picking the session by PID
 cdrun -l [keyword ...]                               list running sessions and their PIDs
 cdrun -m <old-dir> <new-dir>                         after a working directory was renamed or
@@ -46,18 +46,35 @@ cdrun -p $sessionPid -q
 
 啟動時 stdout 只輸出 PID。傳送提示詞成功表示已入列，模型會依序處理；請用 `-s` 查看結果。
 
-### 在 Codex app 裡接手
+### 在 Codex app 和手機上一起看、一起輸入
 
-Codex 的一段對話同一時間只能由一個程式寫入。cdrun 只在有工作時佔用對話，處理完、沒有排隊的提示詞時就放手（`-s` 顯示 `status=released`）。這時可以在 Codex 桌面版，或與它配對的手機上，用 `-n` 的名稱找到這段對話，直接接著對話。這是 Codex 自己保存的對話標題，重新接回或 resume 也會保留。
+Codex 的一段對話同一時間只能由一個 app-server 寫入，而 Codex 桌面版的視窗和與它配對的手機，都連到桌面版自己的 app-server。所以只要裝了 Codex 桌面版，cdrun 就把提示詞交給桌面版執行（和 `-q` 一起送出的除外，見下文）：
 
-之後再用 `-p PID` 傳送提示詞時：
+1. 提示詞排進 Codex 自己的對話佇列（和 `codex queue` 相同）。
+2. cdrun 用桌面版的背景喚醒連結（`codex://threads/wake/<thread>`）請它接手。桌面版在背景打開這段對話並執行佇列，不會跳出或切換視窗；桌面版沒在執行時會在背景啟動。
+3. cdrun 從自己的唯讀 app-server 追蹤這一輪直到完成；`-s` 顯示狀態與最後的回答。
 
-- 沒有其他程式開著這段對話：cdrun 拿回對話，自己執行。
-- Codex app 正開著這段對話：提示詞排進 Codex 的佇列，由 Codex app 執行，結果顯示在 Codex app 裡；`-s` 中這一輪標示為 `delegated`。
+執行期間（包括等待 sleep 或背景程式），在桌面版或手機上都能用 `-n` 的名稱找到這段對話，即時看到進度，也可以繼續輸入，就像在 app 裡開的對話。核准要求也顯示在 app 裡。
 
-cdrun 正在執行時，Codex app 只能檢視、不能輸入，等它放手即可。
+例外是和 `-q` 一起送出的提示詞，例如放在工作排程器裡的 `cdrun -d D:\weather "請更新今日天氣" -q`。這種工作的重點是做完就關掉，所以它由 cdrun 自己的私有 app-server 執行，做完立刻封存；執行期間桌面版和手機會顯示這段對話正由其它程式使用。若桌面版已經開著這段對話（例如先前沒帶 `-q` 的提示詞在那裡執行過），這個提示詞也交給桌面版執行，做完後對話留在桌面版裡（見下文）。沒帶 `-q` 的提示詞一律照上面的方式交給桌面版。
 
-結束 session 時，cdrun 先釋放自己的寫入權，再封存對話，失敗時最多嘗試三次。`-q` 只有確認封存成功才 exit 0；若 Codex app 正持有對話而拒絕封存，或發生其他錯誤，會明確回報失敗並 exit 1。
+桌面版 60 秒內沒有接手時（例如沒有安裝或沒有登入），cdrun 把提示詞從佇列收回，改由自己的私有 app-server 執行，提示詞不會遺失，也不會重複執行。啟動 session 前設定 `CDRUN_CODEX_APP=0`，則一律由私有 app-server 執行：回合進行中桌面版和手機無法開啟這段對話（會顯示正由其它程式使用），閒置時（`-s` 顯示 `status=released`）才能在 app 接手。
+
+由桌面版執行的回合用的是桌面版的環境，不是呼叫 cdrun 時的環境變數；需要沿用呼叫端環境變數的工作，請使用 `CDRUN_CODEX_APP=0`。`--cancel` 只能中斷 cdrun 自己執行的回合；在桌面版執行的回合請在 app 裡停止。
+
+結束 session 時 cdrun 會封存對話。Codex 不允許封存其它 app-server 正開著的對話，外部也沒有請桌面版放手或代為封存的方法（`codex archive` 同樣會被拒絕）。桌面版在背景執行過的對話會一直開著，直到 app 結束；在視窗打開過的對話則在閒置數小時後才放手，手機正在看時也不放手。所以做完所有已接受的工作後，若桌面版仍開著這段對話，broker 只稍等片刻（約 15 秒，狀態顯示 `archiving`），然後照樣結束，把對話留在桌面版裡，請在 app（PC 或手機）裡封存。桌面版正在執行的回合不受影響。這段期間 broker 不再接受提示詞，也不佔用名稱：同名同目錄的 `-d -n` 會開新的 session，`-n` 也優先指向新的 session。其他封存錯誤最多嘗試三次。
+
+啟動或傳送提示詞時也可以加 `-q`，讓 broker 做完已接受的工作後自動結束並封存。例如：
+
+```powershell
+cdrun -d D:\projects\my-project "請完成這項工作" -q
+cdrun -p $sessionPid "最後再檢查一次" -q
+Get-Content -Raw -Encoding UTF8 prompt.txt | cdrun -n my-project - -q
+```
+
+搭配提示詞或 `-d` 的 `-q` 在請求入列後立即返回，exit 0 表示已接受，封存稍後由 broker 執行；啟動或重用仍只在 stdout 輸出 PID。提示詞與關閉要求一起接受，佇列滿載時兩者都不接受。進入關閉流程後不再接受新提示詞。單獨 `-p PID -q` 或 `-n NAME -q` 則等到 session 結束並回報結果，也可以用來等待先前已要求自動關閉的 session（須在 broker 仍執行時呼叫）：封存成功時 stderr 顯示 `exited and archived`；對話仍開在桌面版時顯示 `the Codex app still has its conversation open, so archive it in the app`，兩者都 exit 0；其他封存失敗 exit 1。要讓排程工作做完就封存，請把最後的提示詞和 `-q` 一起送出，不要先送提示詞再另外單獨 `-q`。
+
+以上等待沒有工作期限：即使執行數天，`-q` 也不會中止目前或排隊中的工作。模型等待背景程式的期間，只要回合尚未完成，就繼續等待；模型已結束回合後自行留在背景的程式不算待完成的回合。若要中斷 cdrun 自己執行的回合，可另外使用 `--cancel`；在桌面版執行的回合請在 app 裡停止。
 
 | 指令 | 功能 |
 |---|---|
@@ -65,7 +82,7 @@ cdrun 正在執行時，Codex app 只能檢視、不能輸入，等它放手即�
 | `-n NAME "prompt"` | 傳送提示詞，保留同一段對話的上下文 |
 | `-n NAME -` | 從 UTF-8 stdin 讀取多行提示詞 |
 | `-n NAME -s` | 顯示最近的對話與狀態 |
-| `-n NAME -q` | 結束 session 並確認封存 |
+| `-n NAME -q` | 結束 session 並回報封存結果 |
 | `-p PID <prompt> \| - \| -s \| -q` | 同上，改用 broker PID 指定 |
 | `-l [keyword ...]` | 列出符合所有關鍵字的執行中 session |
 | `-m OLD NEW` | 目錄改名或搬家之後，把 Codex 為舊路徑記的設定搬到新路徑 |
@@ -92,22 +109,22 @@ cdrun -l fund 00919
 
 broker 的名稱不隨內部 app-server 重啟或重新接回對話而改變。broker 結束後，同一個 `-d -n` 會建立新對話並傳回新 PID；它不會接回已封存的舊對話。
 
-對原生對話執行 `-q` 或 `/exit` 會請求 Codex 封存；若原本的 app／CLI 仍持有 writer 而拒絕，會 exit 1，請在該 app／CLI 結束或封存。cdrun 不會終止承載其他對話的共享程序。原生對話的 `--cancel` 請在原本的 app／CLI 操作。
+對原生對話執行 `-q` 或 `/exit` 會請求 Codex 封存；若原本的 app／CLI 仍持有 writer 而拒絕，會 exit 1，請在該 app／CLI 結束或封存。原生對話不能把提示詞與 `-q` 合用，cdrun 會在送出提示詞前拒絕；請先傳送提示詞，再在原本的 app／CLI 結束。cdrun 不會終止承載其他對話的共享程序。原生對話的 `--cancel` 請在原本的 app／CLI 操作。
 
 ### cdrun 專有功能
 
 | 指令 | 功能 |
 |---|---|
 | `-n NAME -s --json` | 以 JSON 輸出回答、逐輪狀態與錯誤 |
-| `-n NAME --cancel` | 中斷當前回合；保留 session 與排隊中的提示詞 |
+| `-n NAME --cancel` | 中斷 cdrun 自己執行的當前回合；保留 session 與排隊中的提示詞 |
 | `-n NAME /exit` | 等排隊工作完成後結束並封存，注入返回代表已入列 |
 | `-d DIR --trust=false` | 停用啟動時的信任覆寫 |
 | `--version` | 顯示版本 |
 | `--help` | 顯示指令說明 |
 
-上述 session 操作也接受 `-p PID`。`-q` 先給排隊工作十秒寬限，再要求停止工作，仍會等待釋放寫入權與封存；不會為了結束等待而砍掉正在封存的 broker。整體等待上限八分鐘，逾時回報失敗。`/技能名稱` 也是 cdrun 專有功能，見下方。
+上述 session 操作也接受 `-p PID`。`-q` 等待所有已接受的回合完成，沒有強制停止期限，再釋放寫入權與封存；Codex app 仍開著對話時，session 照樣結束，對話留在 app 裡。`/技能名稱` 也是 cdrun 專有功能，見下方。
 
-選項放在提示詞前，提示詞請整段加引號。未知選項、無效組合與失效 PID 都會報錯。成功一律 exit 0，失敗一律 exit 1。`-l` 只收關鍵字；`-d` 不能搭配 `-p`、`-s`、`-q`；`-s` 和 `-q` 不能一起使用、不能帶 prompt，而且需要 `-p` 或 `-n`。
+除 `-q` 可以放在提示詞後，其他選項放在提示詞前，提示詞請整段加引號。未知選項、無效組合與失效 PID 都會報錯。成功一律 exit 0，失敗一律 exit 1。`-l` 只收關鍵字；`-d` 不能搭配 `-p`、`-s`；`-s` 和 `-q` 不能一起使用，`-s` 不能帶 prompt，而且需要 `-p` 或 `-n`。
 
 ### 工作目錄與權限
 
@@ -115,7 +132,7 @@ broker 的名稱不隨內部 app-server 重啟或重新接回對話而改變。b
 
 `-d DIR --trust=false` 可停用 cdrun 傳入的信任設定，改由 Codex 自行決定；這個選項不會撤銷既有信任，也不保證 Codex 不記錄新目錄。
 
-模型、沙盒與核准都沿用 Codex 設定（`~/.codex/config.toml`），跟 Codex app 一樣。cdrun 沒有核准視窗，Codex 要求核准的操作一律拒絕；要讓它不停下來問，請在 Codex 設定裡設好，例如：
+模型、沙盒與核准都沿用 Codex 設定（`~/.codex/config.toml`），跟 Codex app 一樣。由桌面版執行的回合，核准要求顯示在桌面版和手機上；由 cdrun 私有 app-server 執行的回合沒有核准視窗，Codex 要求核准的操作一律拒絕。要讓它不停下來問，請在 Codex 設定裡設好，例如：
 
 ```toml
 approval_policy = "never"
@@ -167,13 +184,19 @@ cdrun 依序從 `CDRUN_CODEX_EXE`、PATH、Codex 桌面版安裝目錄尋找 Cod
 $env:CDRUN_CODEX_EXE = 'C:\path\to\codex.exe'
 ```
 
+回合預設交給 Codex 桌面版執行（見上）。要讓之後啟動的 session 一律由 cdrun 自己的私有 app-server 執行：
+
+```powershell
+$env:CDRUN_CODEX_APP = '0'
+```
+
 請在同一 Windows 帳號與權限層級啟動和控制 session。一般 session 的狀態與日誌存於 `%LOCALAPPDATA%\cdrun`，管理員 session 存於 `%LOCALAPPDATA%\cdrun-elevated`。每個 session 的事件與 stderr 日誌各上限 8 MiB；關閉後可自行清理診斷目錄。
 
 ## 使用範圍
 
 - cdrun 控制背景對話，本身沒有互動終端或桌面視窗；要接手請用 Codex app（見上）。`-n` 設定對話名稱。
-- 由 Codex app 執行的那幾輪，用的是 Codex app 的環境，不是 cdrun 啟動時的環境變數。
-- PID 屬於 cdrun 代理。cdrun 啟動的 session 關閉時會清理自己的子程序；原生對話的代理不會關閉共享的 Codex app／CLI 程序。
+- 由 Codex app 執行的回合（預設），用的是 Codex app 的環境，不是 cdrun 啟動時的環境變數；需要時請用 `CDRUN_CODEX_APP=0`。和 `-q` 一起送出、由 cdrun 自己執行的提示詞，則用 cdrun 啟動時的環境。
+- PID 屬於 cdrun 代理。cdrun 啟動的 session 關閉時會清理自己的子程序；cdrun 喚醒或在背景啟動的 Codex app 不屬於 session，不會被關閉；原生對話的代理也不會關閉共享的 Codex app／CLI 程序。
 - session 結束後請清除保存的 PID，避免日後 Windows 重用同一個 PID。
 - 對話各自獨立，但同一目錄中的檔案仍共用；並行修改請使用不同工作目錄。
 - 程序失敗時不會自動重送提示詞，以免重複執行有副作用的工作。

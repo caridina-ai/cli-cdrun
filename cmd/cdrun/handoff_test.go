@@ -18,9 +18,14 @@ type fakeServer struct {
 }
 
 func newFakeServer(t *testing.T, b *broker, answer func(method string) (string, string)) *fakeServer {
+	return newFakeServerFor(t, b, func(w wire) (string, string) { return answer(w.Method) })
+}
+
+// newFakeServerFor is newFakeServer for answers that depend on a call's parameters.
+func newFakeServerFor(t *testing.T, b *broker, answer func(w wire) (string, string)) *fakeServer {
 	reader, writer := io.Pipe()
 	t.Cleanup(func() { reader.Close(); writer.Close() })
-	f := &fakeServer{r: &rpc{in: writer, pending: make(map[string]chan wire), dead: make(chan struct{})}, calls: make(chan wire, 16)}
+	f := &fakeServer{r: &rpc{in: writer, pending: make(map[string]chan wire), dead: make(chan struct{})}, calls: make(chan wire, 1024)}
 	go func() {
 		decoder := json.NewDecoder(reader)
 		for {
@@ -28,8 +33,11 @@ func newFakeServer(t *testing.T, b *broker, answer func(method string) (string, 
 			if decoder.Decode(&w) != nil {
 				return
 			}
-			f.calls <- w
-			result, failure := answer(w.Method)
+			select {
+			case f.calls <- w:
+			default:
+			}
+			result, failure := answer(w)
 			f.r.mu.Lock()
 			ch := f.r.pending[string(w.ID)]
 			f.r.mu.Unlock()
@@ -85,52 +93,6 @@ func runOne(t *testing.T, b *broker, prompt string) {
 			t.Fatal("broker stuck", status)
 		}
 		time.Sleep(10 * time.Millisecond)
-	}
-}
-
-func TestQueuesIntoTheCodexAppWhenItHasTheConversation(t *testing.T) {
-	b, released := newIdleBroker()
-	f := newFakeServer(t, b, func(method string) (string, string) {
-		if method == "thread/resume" {
-			return "", `{"code":-32600,"message":"thread thread already has an active writer"}`
-		}
-		return `{}`, ""
-	})
-	b.connect = func() (*rpc, error) { return f.r, nil }
-	runOne(t, b, "go")
-	if got := f.methods(2); len(got) != 2 || got[0] != "thread/resume" || got[1] != "thread/queue/add" {
-		t.Fatal(got)
-	}
-	if b.state.Turns[0].Status != "delegated" || b.state.Completed != 1 || *released == 0 {
-		t.Fatal(b.state, *released)
-	}
-}
-
-func TestQueuedPromptKeepsSkillAndThread(t *testing.T) {
-	b, _ := newIdleBroker()
-	var params struct {
-		ThreadID, ClientUserMessageID string
-		Input                         []map[string]any
-	}
-	f := newFakeServer(t, b, func(method string) (string, string) {
-		if method == "thread/resume" {
-			return "", `{"code":-32600,"message":"already has an active writer"}`
-		}
-		return `{}`, ""
-	})
-	b.connect = func() (*rpc, error) { return f.r, nil }
-	b.inputs = func(prompt string) ([]any, error) {
-		return []any{object{"type": "text", "text": prompt}, object{"type": "skill", "name": "tap", "path": "x"}}, nil
-	}
-	runOne(t, b, "/tap -done")
-	for i := 0; i < 2; i++ {
-		w := <-f.calls
-		if w.Method == "thread/queue/add" {
-			_ = json.Unmarshal(w.Params, &params)
-		}
-	}
-	if params.ThreadID != "thread" || len(params.ClientUserMessageID) != 36 || len(params.Input) != 2 || params.Input[1]["type"] != "skill" {
-		t.Fatal(params)
 	}
 }
 
