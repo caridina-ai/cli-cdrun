@@ -7,6 +7,8 @@
 ```text
 cdrun -d <working-dir> [-n <name>] [prompt] [-q]     start a session, or prompt the one
                                                      already running; prints its PID
+cdrun -d <working-dir> [prompt] [options] -- <args>  start a new private session with
+                                                     extra Codex app-server arguments
 cdrun -n <name> <prompt> [-q]                        inject a prompt into that session
 cdrun -n <name> - [-q]                               inject a prompt read from stdin
 cdrun -n <name> -s                                   print what that session is showing
@@ -48,7 +50,7 @@ cdrun -p $sessionPid -q
 
 ### 在 Codex app 和手機上一起看、一起輸入
 
-Codex 的一段對話同一時間只能由一個 app-server 寫入，而 Codex 桌面版的視窗和與它配對的手機，都連到桌面版自己的 app-server。所以只要裝了 Codex 桌面版，cdrun 就把提示詞交給桌面版執行（和 `-q` 一起送出的除外，見下文）：
+Codex 的一段對話同一時間只能由一個 app-server 寫入，而 Codex 桌面版的視窗和與它配對的手機，都連到桌面版自己的 app-server。所以在未指定轉送參數的 session，只要裝了 Codex 桌面版，cdrun 就把提示詞交給桌面版執行（和 `-q` 一起送出的除外，見下文）：
 
 1. 提示詞排進 Codex 自己的對話佇列（和 `codex queue` 相同）。
 2. cdrun 用桌面版的背景喚醒連結（`codex://threads/wake/<thread>`）請它接手。桌面版在背景打開這段對話並執行佇列，不會跳出或切換視窗；桌面版沒在執行時會在背景啟動。
@@ -56,7 +58,7 @@ Codex 的一段對話同一時間只能由一個 app-server 寫入，而 Codex �
 
 執行期間（包括等待 sleep 或背景程式），在桌面版或手機上都能用 `-n` 的名稱找到這段對話，即時看到進度，也可以繼續輸入，就像在 app 裡開的對話。核准要求也顯示在 app 裡。
 
-例外是和 `-q` 一起送出的提示詞，例如放在工作排程器裡的 `cdrun -d D:\weather "請更新今日天氣" -q`。這種工作的重點是做完就關掉，所以它由 cdrun 自己的私有 app-server 執行，做完立刻封存；執行期間桌面版和手機會顯示這段對話正由其它程式使用。若桌面版已經開著這段對話（例如先前沒帶 `-q` 的提示詞在那裡執行過），這個提示詞也交給桌面版執行，做完後對話留在桌面版裡（見下文）。沒帶 `-q` 的提示詞一律照上面的方式交給桌面版。
+例外是和 `-q` 一起送出的提示詞，例如放在工作排程器裡的 `cdrun -d D:\weather "請更新今日天氣" -q`。這種工作的重點是做完就關掉，所以它由 cdrun 自己的私有 app-server 執行，做完立刻封存；執行期間桌面版和手機會顯示這段對話正由其它程式使用。若桌面版已經開著這段對話（例如先前沒帶 `-q` 的提示詞在那裡執行過），這個提示詞也交給桌面版執行，做完後對話留在桌面版裡（見下文）。未指定轉送參數且沒帶 `-q` 的提示詞一律照上面的方式交給桌面版。
 
 桌面版 60 秒內沒有接手時（例如沒有安裝或沒有登入），cdrun 把提示詞從佇列收回，改由自己的私有 app-server 執行，提示詞不會遺失，也不會重複執行。啟動 session 前設定 `CDRUN_CODEX_APP=0`，則一律由私有 app-server 執行：回合進行中桌面版和手機無法開啟這段對話（會顯示正由其它程式使用），閒置時（`-s` 顯示 `status=released`）才能在 app 接手。
 
@@ -124,7 +126,24 @@ broker 的名稱不隨內部 app-server 重啟或重新接回對話而改變。b
 
 上述 session 操作也接受 `-p PID`。`-q` 等待所有已接受的回合完成，沒有強制停止期限，再釋放寫入權與封存；Codex app 仍開著對話時，session 照樣結束，對話留在 app 裡。`/技能名稱` 也是 cdrun 專有功能，見下方。
 
-除 `-q` 可以放在提示詞後，其他選項放在提示詞前，提示詞請整段加引號。未知選項、無效組合與失效 PID 都會報錯。成功一律 exit 0，失敗一律 exit 1。`-l` 只收關鍵字；`-d` 不能搭配 `-p`、`-s`；`-s` 和 `-q` 不能一起使用，`-s` 不能帶 prompt，而且需要 `-p` 或 `-n`。
+選項與提示詞可以交錯，提示詞請整段加引號並放在 `--` 之前。未知選項、無效組合與失效 PID 都會報錯。成功一律 exit 0，失敗一律 exit 1。`-l` 只收關鍵字；`-d` 不能搭配 `-p`、`-s`；`-s` 和 `-q` 不能一起使用，`-s` 不能帶 prompt，而且需要 `-p` 或 `-n`。
+
+### 傳遞 Codex 啟動參數
+
+從 v0.5.0 起，第一個獨立的 `--` 是參數分隔符：之前是 cdrun 的選項與提示詞，之後的每個參數依原順序與參數邊界傳給 `codex app-server`，不重新斷詞或改寫。空白、引號和空字串依呼叫端傳入的內容保留。`--` 不再表示後面的內容是提示詞。
+
+```powershell
+cdrun -d D:\projects\my-project "請檢查專案" -n review -- -c model=gpt-6.1-sol
+cdrun -d D:\projects\my-project -n batch "請完成這項工作" -q -- -c 'model_reasoning_effort="high"'
+```
+
+這些是 **app-server** 的參數；例如模型用 `-c model=...`，不是互動式 Codex CLI 的 `--model`。可用參數以本機 `codex app-server --help` 為準，未知的 Codex 參數由 Codex 回報啟動失敗。
+
+有轉送參數時，cdrun 使用私有 app-server 執行，沿用呼叫端環境，閒置時釋放對話；cdrun 不會主動把回合交給使用另一組設定的 Codex app，也不會重設或重啟桌面版。若你在閒置時手動讓 app 接手，之後的提示詞仍須交給持有 writer 的 app 處理，使用該 app 的設定。轉送參數會保留到 session 結束，每次重啟私有 app-server 都會再次套用。私有回合的核准行為與 `CDRUN_CODEX_APP=0` 相同。沒有轉送參數時仍維持預設的桌面版接手行為。
+
+只有 `-d` **建立新 session** 時能帶轉送參數。`-d` 重用同名 session、`-p`／`-n` 注入、查閱、結束、列出、搬移設定等操作若帶非空的轉送參數，會在送出提示詞或關閉要求之前報錯。空的 `--` 視同未帶參數。
+
+`--stdio` 與 `--listen` 由 cdrun 保留，轉送這些選項會報錯。cdrun 的目錄信任覆寫放在轉送參數之後，因此同一個目錄的 `trust_level` 以 cdrun 為準；使用 `--trust=false` 可停用這個覆寫。其餘參數交給 Codex 判定，不會自動加入模型、沙盒或核准設定。
 
 ### 工作目錄與權限
 
@@ -132,7 +151,7 @@ broker 的名稱不隨內部 app-server 重啟或重新接回對話而改變。b
 
 `-d DIR --trust=false` 可停用 cdrun 傳入的信任設定，改由 Codex 自行決定；這個選項不會撤銷既有信任，也不保證 Codex 不記錄新目錄。
 
-模型、沙盒與核准都沿用 Codex 設定（`~/.codex/config.toml`），跟 Codex app 一樣。由桌面版執行的回合，核准要求顯示在桌面版和手機上；由 cdrun 私有 app-server 執行的回合沒有核准視窗，Codex 要求核准的操作一律拒絕。要讓它不停下來問，請在 Codex 設定裡設好，例如：
+模型、沙盒與核准預設沿用 Codex 設定（`~/.codex/config.toml`），跟 Codex app 一樣；用 `--` 明確轉送的啟動參數會覆寫私有 app-server 的設定。由桌面版執行的回合，核准要求顯示在桌面版和手機上；由 cdrun 私有 app-server 執行的回合沒有核准視窗，Codex 要求核准的操作一律拒絕。要讓它不停下來問，請在 Codex 設定裡設好，例如：
 
 ```toml
 approval_policy = "never"

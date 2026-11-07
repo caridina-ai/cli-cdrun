@@ -726,6 +726,7 @@ type appServer struct {
 	mu       sync.Mutex
 	exe, dir string
 	trust    bool
+	args     []string
 	stderr   io.Writer
 	cmd      *exec.Cmd
 	in       io.WriteCloser
@@ -742,7 +743,7 @@ func (s *appServer) start(notify func(wire)) (*rpc, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.stopLocked()
-	args := []string{"app-server", "--stdio"}
+	args := append([]string{"app-server", "--stdio"}, s.args...)
 	if s.trust {
 		key, _ := json.Marshal(s.dir)
 		args = append(args, "-c", "projects."+string(key)+".trust_level=\"trusted\"")
@@ -797,7 +798,7 @@ func (s *appServer) stopLocked() {
 	s.cmd, s.in = nil, nil
 }
 
-func serve(dir, name, codexExe string, trust bool) error {
+func serve(dir, name, codexExe string, trust bool, codexArgs []string) error {
 	if err := secureStateRoot(); err != nil {
 		return err
 	}
@@ -821,7 +822,7 @@ func serve(dir, name, codexExe string, trust bool) error {
 		return err
 	}
 	defer events.Close()
-	server := &appServer{exe: codexExe, dir: dir, trust: trust, stderr: &cappedWriter{file: logs, limit: maxLogBytes}}
+	server := &appServer{exe: codexExe, dir: dir, trust: trust, args: codexArgs, stderr: &cappedWriter{file: logs, limit: maxLogBytes}}
 	defer server.stop()
 	b := &broker{state: snapshot{PID: os.Getpid(), Cwd: dir, Name: name, Status: "idle", LogDir: sessionDir, Turns: []turn{}}, queue: make(chan string, 32), finished: make(chan turn, 16), stop: make(chan struct{}), events: events}
 	b.connect = func() (*rpc, error) { return server.start(b.event) }
@@ -829,7 +830,7 @@ func serve(dir, name, codexExe string, trust bool) error {
 	if b.r, err = b.connect(); err != nil {
 		return err
 	}
-	// Model, sandbox and approvals all come from the user's own Codex config, as in the Codex app.
+	// Settings come from Codex config, with any explicit caller overrides on this server.
 	raw, err := b.r.call("thread/start", object{"cwd": dir})
 	if err != nil {
 		return err
@@ -850,7 +851,7 @@ func serve(dir, name, codexExe string, trust bool) error {
 	b.holding = true
 	b.mu.Unlock()
 	b.writerActive = func() (bool, error) { return nativeWriterActive(started.Thread.ID) }
-	if os.Getenv("CDRUN_CODEX_APP") != "0" {
+	if os.Getenv("CDRUN_CODEX_APP") != "0" && len(codexArgs) == 0 {
 		b.wake = func() error { return wakeCodexApp(started.Thread.ID) }
 	}
 	b.inputs = func(prompt string) ([]any, error) { return skillInput(b.r, dir, prompt) }
@@ -950,7 +951,7 @@ func fetch(e endpoint, path string, prompt *string) ([]byte, error) {
 	}
 	return data, nil
 }
-func launch(dir, name, prompt string, trust, quit bool) error {
+func launch(dir, name, prompt string, trust, quit bool, codexArgs ...string) error {
 	abs, err := filepath.Abs(dir)
 	if err != nil {
 		return err
@@ -969,7 +970,8 @@ func launch(dir, name, prompt string, trust, quit bool) error {
 		return err
 	}
 	cleanStaleEndpoints()
-	return launchProcess([]string{"__serve", abs, name, codexExe, strconv.FormatBool(trust)}, prompt, true, quit)
+	args := append([]string{"__serve", abs, name, codexExe, strconv.FormatBool(trust)}, codexArgs...)
+	return launchProcess(args, prompt, true, quit)
 }
 
 func launchProcess(args []string, prompt string, printPID, quit bool) error {
@@ -1027,7 +1029,7 @@ func launchProcess(args []string, prompt string, printPID, quit bool) error {
 	return fmt.Errorf("session startup failed: %s (log: %s)", strings.TrimSpace(string(details)), f.Name())
 }
 
-const version = "0.4.0"
+const version = "0.5.0"
 const usage = `cdrun - start and drive Codex sessions by PID
 
 usage:
@@ -1056,6 +1058,12 @@ options:
                or thread ID (case-insensitive)
   -m           move <old-dir>'s table in Codex's config.toml (its trust) to
                <new-dir>. Move the directory first; nothing is overwritten.
+  -- <args>    forward arguments verbatim to a NEW private Codex app-server.
+               Options and prompt may be interspersed before --. For example:
+               cdrun -d DIR "hello" -n bot -- -c model=MODEL
+               Reuse and non-launch commands reject nonempty forwarded arguments.
+               --stdio/--listen are reserved; cdrun's trust override takes priority.
+               With forwarded arguments turns stay here, rather than in the app.
 
 cdrun extensions: -s --json, --cancel, -d --trust=false, --version, /exit,
 and discovered /skill-name commands. An idle session releases its conversation
@@ -1078,15 +1086,19 @@ func run(args []string) error {
 		return serveNative(args[1], args[2])
 	}
 	if len(args) > 0 && args[0] == "__serve" {
-		if len(args) != 5 {
+		if len(args) < 5 {
 			return errors.New("invalid internal arguments")
 		}
 		trust, err := strconv.ParseBool(args[4])
 		if err != nil {
 			return err
 		}
-		return serve(args[1], args[2], args[3], trust)
+		if err := validateCodexArgs(args[5:]); err != nil {
+			return err
+		}
+		return serve(args[1], args[2], args[3], trust, args[5:])
 	}
+	localArgs, codexArgs := splitCodexArgs(args)
 	fs := flag.NewFlagSet("cdrun", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	dir := fs.String("d", "", "working directory")
@@ -1100,15 +1112,22 @@ func run(args []string) error {
 	trust := fs.Bool("trust", true, "automatically trust this workspace for this private app-server only")
 	cancel := fs.Bool("cancel", false, "interrupt the active turn; keep queued prompts")
 	move := fs.Bool("m", false, "move what Codex keeps for a working directory that moved")
-	if err := fs.Parse(quitArgs(args)); err != nil {
+	ordered, err := interspersedArgs(fs, localArgs)
+	if err != nil {
+		return fmt.Errorf("%w\n%s", err, usage)
+	}
+	if err := fs.Parse(ordered); err != nil {
 		if err == flag.ErrHelp {
+			if len(codexArgs) > 0 {
+				return errors.New("arguments after -- require -d and a new session; cannot combine with help")
+			}
 			fmt.Println(usage)
 			return nil
 		}
 		return fmt.Errorf("%w\n%s", err, usage)
 	}
 	if *showVersion {
-		if len(args) != 1 {
+		if len(localArgs) != 1 || len(codexArgs) > 0 {
 			return errors.New("--version must be used alone")
 		}
 		fmt.Println("cdrun " + version)
@@ -1131,6 +1150,14 @@ func run(args []string) error {
 			trustSet = true
 		}
 	})
+	if len(codexArgs) > 0 {
+		if *dir == "" || *target != "" || *screen || *list || *move || *cancel {
+			return errors.New("arguments after -- require -d and a new session; cannot forward to an existing session or another command")
+		}
+		if err := validateCodexArgs(codexArgs); err != nil {
+			return err
+		}
+	}
 	if (seen["d"] && *dir == "") || (seen["n"] && strings.TrimSpace(*name) == "") || (seen["p"] && *target == "") {
 		return errors.New(usage)
 	}
@@ -1160,7 +1187,7 @@ func run(args []string) error {
 	}
 	for _, s := range fs.Args() {
 		if strings.HasPrefix(s, "-") && s != "-" {
-			return fmt.Errorf("unexpected argument %q; quote the whole prompt and put options before it\n%s", s, usage)
+			return fmt.Errorf("unexpected argument %q; quote the whole prompt\n%s", s, usage)
 		}
 	}
 	prompt := strings.Join(fs.Args(), " ")
@@ -1174,12 +1201,12 @@ func run(args []string) error {
 		}
 		prompt = string(data)
 	}
-	prompt, err := normalize(prompt)
+	prompt, err = normalize(prompt)
 	if err != nil {
 		return err
 	}
 	if *dir != "" {
-		return startOrReuse(*dir, *name, prompt, *trust, *quit)
+		return startOrReuse(*dir, *name, prompt, *trust, *quit, codexArgs...)
 	}
 	if !*screen && !*quit && !*cancel && prompt == "" {
 		return fmt.Errorf("nothing to inject\n%s", usage)

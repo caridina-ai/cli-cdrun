@@ -119,7 +119,7 @@ func sameDirectory(a, b string) bool {
 	return strings.EqualFold(filepath.Clean(strings.ReplaceAll(a, "/", `\`)), filepath.Clean(strings.ReplaceAll(b, "/", `\`)))
 }
 
-func startOrReuse(dir, name, prompt string, trust, quit bool) error {
+func startOrReuse(dir, name, prompt string, trust, quit bool, codexArgs ...string) error {
 	// Windows mutex ownership belongs to an OS thread, not a Go goroutine.
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
@@ -164,6 +164,9 @@ func startOrReuse(dir, name, prompt string, trust, quit bool) error {
 	}
 	if len(found) == 1 {
 		s := found[0]
+		if len(codexArgs) > 0 {
+			return fmt.Errorf("session %q is already running (pid %d); arguments after -- require a new session", name, s.PID)
+		}
 		if !sameDirectory(abs, s.Dir) {
 			return fmt.Errorf("session %q is already running in %s (pid %d); no new session started", name, s.Dir, s.PID)
 		}
@@ -176,7 +179,7 @@ func startOrReuse(dir, name, prompt string, trust, quit bool) error {
 		fmt.Println(s.PID)
 		return nil
 	}
-	return launch(abs, name, prompt, trust, quit)
+	return launch(abs, name, prompt, trust, quit, codexArgs...)
 }
 
 func (s runningSession) matches(keywords []string) bool {

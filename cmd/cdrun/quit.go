@@ -4,41 +4,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"strings"
 
 	"golang.org/x/sys/windows"
 )
-
-// quitArgs permits -q after a prompt without interpreting other prompt words as flags.
-// Flag values and everything after -- retain their literal meaning.
-func quitArgs(args []string) []string {
-	var flags, rest []string
-	positional := false
-	for i := 0; i < len(args); i++ {
-		s := args[i]
-		if s == "--" {
-			rest = append(rest, args[i:]...)
-			break
-		}
-		if s == "-q" || s == "--q" || strings.HasPrefix(s, "-q=") || strings.HasPrefix(s, "--q=") {
-			flags = append(flags, s)
-			continue
-		}
-		rest = append(rest, s)
-		if !positional {
-			switch s {
-			case "-d", "--d", "-n", "--n", "-p", "--p":
-				if i+1 < len(args) {
-					i++
-					rest = append(rest, args[i])
-				}
-			default:
-				positional = !strings.HasPrefix(s, "-") || s == "-"
-			}
-		}
-	}
-	return append(flags, rest...)
-}
 
 // submitPrompt marks draining in the same broker request that accepts the last prompt.
 func submitPrompt(ep endpoint, prompt string, quit bool) error {

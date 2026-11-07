@@ -7,7 +7,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"reflect"
 	"strconv"
 	"strings"
 	"testing"
@@ -15,20 +14,6 @@ import (
 
 	"golang.org/x/sys/windows"
 )
-
-func TestQuitArgumentPlacement(t *testing.T) {
-	for _, tt := range []struct{ args, want []string }{
-		{[]string{"-p", "123", "hello", "-q"}, []string{"-q", "-p", "123", "hello"}},
-		{[]string{"-d", "dir", "-", "-q"}, []string{"-q", "-d", "dir", "-"}},
-		{[]string{"-n", "-q", "hello"}, []string{"-n", "-q", "hello"}},
-		{[]string{"-p", "123", "--", "-q"}, []string{"-p", "123", "--", "-q"}},
-		{[]string{"-p", "123", "hello", "-unknown"}, []string{"-p", "123", "hello", "-unknown"}},
-	} {
-		if got := quitArgs(tt.args); !reflect.DeepEqual(got, tt.want) {
-			t.Fatalf("%q: got %q, want %q", tt.args, got, tt.want)
-		}
-	}
-}
 
 func postPrompt(b *broker, path, prompt string) int {
 	body, _ := json.Marshal(request{Prompt: prompt})
@@ -143,6 +128,7 @@ func TestCLICombinedQuitRouting(t *testing.T) {
 		{"-p", strconv.Itoa(ep.PID), "-q", "hello"},
 		{"-n", "fixture", "hello", "-q"},
 		{"-d", dir, "-n", "fixture", "hello", "-q"},
+		{"hello", "-d", dir, "-n", "fixture", "-q", "--"},
 	} {
 		b.state = snapshot{PID: ep.PID, Cwd: dir, Name: "fixture", Status: "idle"}
 		b.closing = false
