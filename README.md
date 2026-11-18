@@ -211,6 +211,46 @@ $env:CDRUN_CODEX_APP = '0'
 
 請在同一 Windows 帳號與權限層級啟動和控制 session。一般 session 的狀態與日誌存於 `%LOCALAPPDATA%\cdrun`，管理員 session 存於 `%LOCALAPPDATA%\cdrun-elevated`。每個 session 的事件與 stderr 日誌各上限 8 MiB；關閉後可自行清理診斷目錄。
 
+### 從 Job Object 裡呼叫
+
+沙盒、程式的指令工具、工作排程器等宿主，常把它們啟動的程序放進 Windows 的 Job Object。cdrun 啟動 broker 與原生對話的代理時會先嘗試脫離呼叫端的 Job；Job 不允許脫離時，就留在該 Job 裡照常啟動（v0.5.0 在這種 Job 裡會失敗並顯示 `exec: already started`）。例如工作排程器的工作就在不允許脫離、但關閉時不結束程序的 Job 裡執行，排程工作結束後 session 照常執行。
+
+留在 Job 裡通常沒有影響。但若該 Job 設了 `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`，宿主關閉 Job 時（例如該次指令或宿主程式結束），cdrun 留下的背景程序會一起被結束：
+
+- `-d` 新建的 session：broker 和它的私有 app-server 被結束，PID 失效，`-l` 不再列出。cdrun 自己執行中的回合（和 `-q` 一起送出的提示詞、`CDRUN_CODEX_APP=0`、帶轉送參數，或桌面版沒接手的）會被中斷，還沒開始的提示詞不再執行，對話也不會封存。對話仍在 Codex 的歷史裡，可以在 app 裡繼續或封存。桌面版本來就在執行時，交給它的回合在桌面版裡繼續。
+- 原生對話的代理也被結束。下次 `-l` 或 `-n` 會重新建立，但 PID 會改變；請用 `-n` 名稱操作，不要保存原生對話的 PID。
+- `-p`／`-n` 傳送提示詞、`-s` 等做完就返回的指令本身不受影響，操作在別處啟動的 session 時照常運作。
+
+在宿主的 shell 裡執行下面的 PowerShell，可以檢查目前所在的 Job。`killOnJobClose=True` 時會發生上述情況；`inJob=False` 或 `killOnJobClose=False` 則不會。
+
+```powershell
+Add-Type -Namespace CdrunProbe -Name Job -MemberDefinition @'
+[DllImport("kernel32.dll")] public static extern bool IsProcessInJob(IntPtr process, IntPtr job, out bool result);
+[DllImport("kernel32.dll")] public static extern bool QueryInformationJobObject(IntPtr job, int infoClass, byte[] info, int length, IntPtr returned);
+'@
+$inJob = $false
+[CdrunProbe.Job]::IsProcessInJob([Diagnostics.Process]::GetCurrentProcess().Handle, [IntPtr]::Zero, [ref]$inJob) | Out-Null
+if (-not $inJob) { 'inJob=False' } else {
+  $info = New-Object byte[] 144
+  [CdrunProbe.Job]::QueryInformationJobObject([IntPtr]::Zero, 9, $info, 144, [IntPtr]::Zero) | Out-Null
+  $flags = [BitConverter]::ToUInt32($info, 16)
+  'inJob=True flags=0x{0:x} breakawayOK={1} killOnJobClose={2}' -f $flags, (($flags -band 0x800) -ne 0), (($flags -band 0x2000) -ne 0)
+}
+```
+
+遇到 `killOnJobClose=True` 時，任選一種方式：
+
+- 從一般的終端機視窗啟動 session，在宿主裡只用 `-n NAME` 傳送提示詞、查閱和結束。
+- 從宿主透過工作排程器啟動 session，之後用 `-n NAME` 操作。session 使用排程工作的環境，不是宿主的環境變數；排程工作結束前 session 可能還沒建立，可用 `-l` 確認。
+
+  ```powershell
+  $action = New-ScheduledTaskAction -Execute (Get-Command cdrun).Source -Argument '-d D:\projects\my-project -n my-project "請先閱讀專案並說明它的用途"'
+  Register-ScheduledTask -TaskName cdrun-my-project -Action $action -Force | Out-Null
+  Start-ScheduledTask -TaskName cdrun-my-project
+  ```
+
+- 宿主可以設定時，讓它的 Job 允許脫離（`JOB_OBJECT_LIMIT_BREAKAWAY_OK`），cdrun 就會自動脫離。
+
 ## 使用範圍
 
 - cdrun 控制背景對話，本身沒有互動終端或桌面視窗；要接手請用 Codex app（見上）。`-n` 設定對話名稱。
