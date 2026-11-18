@@ -984,14 +984,22 @@ func launchProcess(args []string, prompt string, printPID, quit bool) error {
 		return err
 	}
 	defer f.Close()
-	cmd := exec.Command(exe, args...)
-	cmd.Stdout = f
-	cmd.Stderr = f
-	cmd.Env = cleanEnv()
-	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true, CreationFlags: windows.CREATE_NO_WINDOW | windows.CREATE_NEW_PROCESS_GROUP | windows.CREATE_BREAKAWAY_FROM_JOB}
-	if err = cmd.Start(); err != nil {
-		cmd.SysProcAttr.CreationFlags = windows.CREATE_NO_WINDOW | windows.CREATE_NEW_PROCESS_GROUP
-		if err = cmd.Start(); err != nil {
+	// An exec.Cmd can be started only once, even after a failed Start, so each attempt
+	// gets a fresh one.
+	start := func(flags uint32) (*exec.Cmd, error) {
+		cmd := exec.Command(exe, args...)
+		cmd.Stdout = f
+		cmd.Stderr = f
+		cmd.Env = cleanEnv()
+		cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true, CreationFlags: flags}
+		return cmd, cmd.Start()
+	}
+	// Leave the caller's job when it allows that; a job that denies breakaway keeps the
+	// process, which then still creates and owns its private job.
+	flags := uint32(windows.CREATE_NO_WINDOW | windows.CREATE_NEW_PROCESS_GROUP)
+	cmd, err := start(flags | windows.CREATE_BREAKAWAY_FROM_JOB)
+	if err != nil {
+		if cmd, err = start(flags); err != nil {
 			return err
 		}
 	}
